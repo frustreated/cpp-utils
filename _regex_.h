@@ -1,0 +1,472 @@
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// _regex_.h - header file for RE string search class.
+//
+// Encapsulates a FSA-based regular expression matcher.
+//
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Defines structures and functions for:
+// 1. Parsing a regular expression into a parse tree.
+// 2. Computing the nullable, firstpos, lastpos,
+//    and followpos functions for each node of the tree.
+// 3. Building the DFA states from the above functions.
+// 4. Building the transition table for the DFA.
+// 5. Matching a string using the transition table.
+//
+// The tree consists of interior nodes and leaf nodes;
+// the interior nodes are operator nodes: *, cat, |, etc.
+// the leaf nodes are the basic symbols.
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/*
+----------------------------------------------------
+The vocabulary for *Very Basic* regular expressions.
+Not handled separately since it is part of the basic
+regular expressions and is integrated in that code.
+----------------------------------------------------
+	expression	:=  catenation | e
+	catenation	:=	repetition [ catenation ]
+	repetition	:=  simple_char ['*']
+	simple_char	:=	char_class | any_char | literal | esc_char
+	char_class	:=  '[' range+ ']' | '[^' range+ ']'
+	range		:=	literal [ '-' literal ]
+	any_char	:=  '.'
+	literal		:=  'a' | 'b' | 'c' | 'd' | 'e' | ...
+	esc_char	:=	'\n' | '\r' | '\t' | '\v' | '\f' | '\a' | '\xhh' (two-digit hex value)
+
+----------------------------------------------------
+The vocabulary for Basic regular expressions (-G)
+----------------------------------------------------
+	expression	:=  catenation | e
+	catenation	:=	repetition [ catenation ]
+	repetition	:=  '\(' expression '\)' [ expression ] ['\N'] |
+					simple_char ['\{m,n\}'] |
+					simple_char ['*']
+	simple_char	:=	char_class | any_char | literal | esc_char
+	char_class	:=  '[' range+ ']' | '[^' range+ ']'
+	range		:=	literal [ '-' literal ]
+	any_char	:=  '.'
+	literal		:=  'a' | 'b' | 'c' | 'd' | 'e' | ...
+	esc_char	:=	'\n' | '\r' | '\t' | '\v' | '\f' | '\a' | '\xhh' (two-digit hex value)
+
+----------------------------------------------------
+The vocabulary for Full regular expressions (-E)
+----------------------------------------------------
+	expression	:=  alternation | e
+	alternation	:=	catenation [ { '|' | NEWLINE } alternation ] |
+					[ catenation ] { '|' | NEWLINE } alternation
+	catenation	:=	repetition [ catenation ]
+	repetition	:=  '(' expression ')' [ '*' | '?' | '+' ] |
+					'(' expression ')' ['{m,n}'] |
+					simple_char ['{m,n}'] |
+					simple_char [ '*' | '?' | '+' ]
+	simple_char	:=	char_class | any_char | literal | esc_char
+	char_class	:=  '[' range+ ']' | '[^' range+ ']'
+	range		:=	literal [ '-' literal ]
+	any_char	:=  '.'
+	literal		:=  'a' | 'b' | 'c' | 'd' | 'e' | ...
+	esc_char	:=	'\n' | '\r' | '\t' | '\v' | '\f' | '\a' | '\xhh' (two-digit hex value)
+
+TODO:
+1. For all types of regular expressions, account for ^ at the
+	beginning of an entire RE, and $ at the end of an entire RE.
+2. Account for \< and \> (word boundary symbols).
+3. For Basic REs, account for the \N in repetition.
+4. For all REs, capture beginning and end of match.
+5. Redesign the transition table to be faster/optimized.
+*/
+
+#ifndef __regex_already_included_vasya__
+#define __regex_already_included_vasya__
+
+#include "_array_.h"
+#include "_strfuncs_.h"
+
+#if defined(UNICODE) || defined(_UNICODE)
+	#error soige utils: _regex_ does not support Unicode compilation
+#endif
+
+namespace soige {
+
+
+class _regex_
+{
+typedef unsigned char  uchar;
+typedef unsigned short ushort;
+
+public:
+	//------------------------------------------------------------
+	// internal enums and structs definitions
+
+	// error codes and messages borrowed from GNU regex
+	enum re_error_code
+	{
+		REG_NOERROR = 0,	/* Success. */
+
+		/* POSIX regcomp return error codes. (In the order listed in the standard.) */
+		REG_BADPAT,			/* Not implemented. */
+		REG_ECOLLATE,		/* Not implemented. */
+		REG_ECTYPE,			/* Not implemented - all chars are valid. */
+		REG_EESCAPE,		/* Trailing backslash. */
+		REG_ESUBREG,		/* Invalid back reference. */
+		REG_EBRACK,			/* Unmatched left bracket. */
+		REG_EPAREN,			/* Parenthesis imbalance. */ 
+		REG_EBRACE,			/* Unmatched \{. */
+		REG_BADBR,			/* Invalid contents of \{\}. */
+		REG_ERANGE,			/* Invalid range end. */
+		REG_ESPACE,			/* Ran out of memory. */
+		REG_BADRPT,			/* No preceding re for repetition op. */
+		
+		/* Error codes we added */
+		REG_ESIZE,			/* Compiled pattern bigger than 2^16 nodes. */
+		REG_EHEX			/* Invalid hexadecimal char value after \. */
+	};
+
+	static const char* re_error_msg[];
+
+	// a simple dynamically allocated set of shorts (for state sets)
+	struct short_set
+	{
+		ushort*	_array;
+		int		_size;
+		int		_allocSize;
+		short_set() {
+			_array = 0; _size = _allocSize = 0;
+		}
+		short_set(const short_set& other) {
+			_array = 0; _size = other._size;
+			_allocSize = other._allocSize;
+			if(_size == 0) return;
+			_array = (ushort*) malloc( _allocSize*sizeof(ushort) );
+			memcpy( _array, other._array, _size*sizeof(ushort) );
+		}
+		~short_set() {
+			clear();
+		}
+		short_set& operator=(const short_set& other) {
+			if(_array == other._array) return *this;
+			clear();
+			if(other._size == 0) return *this;
+			_size = other._size;
+			_allocSize = other._allocSize;
+			_array = (ushort*) malloc( _allocSize*sizeof(ushort) );
+			memcpy( _array, other._array, _size*sizeof(ushort) );
+			return *this;
+		}
+		void clear() {
+			if(_array) free(_array);
+			_array = 0;
+			_size = _allocSize = 0;
+		}
+		void clear_size() {
+			_size = 0;
+		}
+		void reserve(int el_count) {
+			clear();
+			_allocSize = (el_count > 0)? el_count : 1;
+			_array = (ushort*) malloc( _allocSize*sizeof(ushort) );
+			memset( _array, 0, _allocSize*sizeof(ushort) );
+		}
+		ushort operator[](int index) const {
+			return _array[index];
+		}
+		int size() const {
+			return _size;
+		}
+		bool contains(ushort elem) const {
+			if(_size == 0) return false;
+			int low = 0, mid, high = _size - 1;
+			while (low <= high) {
+				mid = (low + high) >> 1;
+				if( _array[mid] < elem )
+					low = mid + 1;
+				else if( _array[mid] > elem )
+					high = mid - 1;
+				else
+					return true;
+			}
+			return false;
+		}
+		void insert(ushort elem) {
+			int low = 0, mid, high = _size - 1;
+			while (low <= high) {
+				mid = (low + high) >> 1;
+				if( _array[mid] < elem )
+					low = mid + 1;
+				else if( _array[mid] > elem )
+					high = mid - 1;
+				else
+					return; // element already exists
+			}
+			// insert new elem at index 'low'
+			if(_size >= _allocSize) {
+				_allocSize = _size * 2 + 1;
+				_array = (ushort*) realloc( _array, _allocSize*sizeof(ushort) );
+			}
+			if(low < _size)
+				memmove( &_array[low+1], &_array[low], (_size-low)*sizeof(ushort) );
+			_array[low] = elem;
+			_size++;
+		}
+		void insert_all_from(const short_set& other) {
+			for(int i=0; i<other._size; i++)
+				insert( other._array[i] );
+		}
+	};
+
+	// enum for node type in a parse tree
+	enum node_type
+	{
+		type_none	= 0,
+		// operator (interior) node types
+		type_cat	= 1,	// concatenation
+		type_or		= 2,	// |
+		type_star	= 4,	// *
+		// symbol (leaf) node types
+		type_char	= 8,
+		type_dot	= 16,
+		type_class	= 32,
+		type_empty	= 64	// e-node (used as a leaf of the '?' op)
+	};
+
+	// the node of the regex parse tree
+	struct node
+	{
+		node_type	type;
+		union {
+			uchar chr;	// if type == type_char
+			bool* cls;	// if type == type_class
+		};
+		node*	c1;  // left child
+		node*	c2;  // right child
+		// the members below are not copied during node assignment
+		// or copy-constructing because they are populated only after
+		// the parse tree is built, i.e. when copying can no longer occur
+		ushort		treepos;
+		bool		nullable;
+		short_set	firstpos;
+		short_set	lastpos;
+		short_set	followpos;
+
+		node(node_type ntype) {
+			type = ntype; cls = 0; c1 = c2 = 0;
+			treepos = 0; nullable = false;
+		}
+		node(const node& other) {
+			type = other.type;
+			if(type == type_class) {
+				cls = (bool*) malloc( 256*sizeof(bool) );
+				memcpy( cls, other.cls, 256*sizeof(bool) );
+			} else chr = other.chr;
+			c1 = c2 = 0; treepos = 0;
+			nullable = false;
+		}
+		~node() {
+			if(type == type_class && cls) free(cls);
+			type = type_none; cls = 0; c1 = c2 = 0;
+			treepos = 0; nullable = false;
+			firstpos.clear(); lastpos.clear(); followpos.clear();
+		}
+		bool makecharclass() {
+			type = type_class;
+			cls = (bool*) malloc( 256*sizeof(bool) );
+			return (cls != 0);
+		}
+		bool isleaf()	{ return (!c1 && !c2); }
+	private:
+		void operator=(const node& other) { }
+	};
+
+	// struct used during the building of the transition table
+	struct dfa_state
+	{
+		bool	marked;
+		ushort	state;
+		dfa_state(bool m = true, ushort s = 0) { marked = m; state = s; }
+		bool operator==(const dfa_state& r) const { return state == r.state; }
+		bool operator<(const dfa_state& r) const { return state < r.state; }
+	};
+
+	// transition struct
+	struct transition
+	{
+		ushort	from_state;
+		bool	on_any_char;	// is this transition on dot...
+		uchar	on_char;		// ...or a specific character?
+		ushort	to_state;
+		transition(ushort fromstate = 0, char onchar = 0, ushort tostate = 0) {
+			from_state = fromstate;
+			on_any_char = false;
+			on_char = onchar;
+			to_state = tostate;
+		}
+	};
+
+	// a supposedly fast transition table with specialized operations
+	struct transition_table
+	{
+		transition*	_array;
+		int			_size;
+		int			_allocSize;
+
+		transition_table()
+			{ _array = 0; _size = _allocSize = 0; }
+		~transition_table()
+			{ clear(); }
+		void clear()
+			{ if(_array) free(_array); _array = 0; _size = _allocSize = 0; }
+		transition* operator[](int index) const
+			{ return &_array[index]; }
+		int size() const
+			{ return _size; }
+		transition* end() const
+			{ return (_array + _size); }
+		transition* find_first_from_transition(int from_state) const {
+			if(_size == 0) return end();
+			int low = 0, mid, high = _size - 1;
+			while (low <= high) {
+				mid = (low + high) >> 1;
+				if( _array[mid].from_state < from_state )
+					low = mid + 1;
+				else if( _array[mid].from_state > from_state )
+					high = mid - 1;
+				else {
+					// found; go back to first matching transition
+					while( (--mid >= 0) && (_array[mid].from_state == from_state) ) ;
+					return &_array[mid+1];
+				}
+			}
+			return end();
+		}
+		void insert(const transition& tran) {
+			int low = 0, mid, high = _size - 1;
+			transition* pt;
+			while (low <= high) {
+				mid = (low + high) >> 1;
+				pt = &_array[mid];
+				if( pt->from_state == tran.from_state &&
+					pt->to_state == tran.to_state &&
+					((pt->on_any_char && pt->on_any_char == tran.on_any_char) ||
+					 (!pt->on_any_char && !tran.on_any_char && pt->on_char == tran.on_char)) )
+					return; // equal, already exists
+				else if(
+						 (pt->from_state < tran.from_state) ||
+						 (
+						  (pt->from_state == tran.from_state) &&
+						  ((pt->on_any_char && !tran.on_any_char) ||
+						   (pt->on_char < tran.on_char) ||
+						   (pt->on_char == tran.on_char && pt->to_state < tran.to_state))
+						 )
+					   )
+					low = mid + 1;
+				else  // mid is greater
+					high = mid - 1;
+			}
+			// insert new tran at index 'low'
+			if(_size >= _allocSize) {
+				_allocSize = _size * 1.5 + 1;
+				_array = (transition*) realloc( _array, _allocSize*sizeof(transition) );
+			}
+			if(low < _size)
+				memmove( &_array[low+1], &_array[low], (_size-low)*sizeof(transition) );
+			_array[low] = tran;
+			_size += 1;
+		}
+	private:
+		transition_table(const transition_table& other) { }
+		void operator=(const transition_table& other) { }
+	};
+
+	//------------------------------------------------------------
+
+public:
+	_regex_();
+	virtual ~_regex_();
+
+	void clear();
+	bool initPattern(const char* pattern,
+					 bool fullRegex = false,
+					 bool caseSensitive = true,
+					 bool matchEntireString = false);
+
+	bool match (const char* pString,
+				long  stringLen,
+				long* pMatchStart = NULL,
+				long* pMatchLength = NULL,
+				bool fastReturn = false);
+
+	const char* errstr() const;
+
+#if defined(DEBUG) || defined(_DEBUG)
+	void printDebugInfo();
+	void debug_walk_tree(node* pnode, int level = -1);
+	void debug_print_node(node* pnode, int level);
+	void debug_print_transitions();
+#endif
+
+private:
+	char*	_originalExpr;	// the original regular expression
+	char*	_regexExpr;		// internal - normalized - regular expression
+	bool	_fullRegex;		// does parsing/matching follow full regex or basic regex rules?
+	bool	_caseSensitive;
+	// can bound the pattern with ^$ to make it match entire strings,
+	// but grep also has a separate command line switch for this,
+	// so keep it as a flag here as well
+	bool	_entireString;
+	node*	_parseTree;
+	re_error_code		_reError;
+	// DFA states-related vars
+	transition_table	_transitions;
+	short_set			_accepting_states;
+	short_set			_running_states;
+
+private:
+	//------------------------------------------------------------
+	// internal func prototypes
+
+	// regex-parsing/tree-building funcs;
+	// all eat_xxx functions return the number of chars eaten
+	// or -1 on error (in which case they do their specific
+	// cleanup and set the internal error code)
+	int eat_expression		(const char* substr, node** ppnode);
+	int eat_alternation		(const char* substr, node** ppnode);
+	int eat_catenation		(const char* substr, node** ppnode);
+	int eat_repetition		(const char* substr, node** ppnode);
+	int eat_simple_char		(const char* substr, node** ppnode);
+	int eat_char_class		(const char* substr, node* pcurnode);
+	int eat_m_to_n			(const char* substr, node* pnode_to_m_n, node** ppnode);
+	node* tree_copy			(node* proot);
+	node* tree_catenate		(node* pleft, node* pright);
+
+	// DFA state building and manipulating funcs
+	void mark_nodes_position_in_tree(node* pnode, bool reset_counter = false);
+	void compute_nullable	(node* pnode);
+	void compute_firstpos	(node* pnode);
+	void compute_lastpos	(node* pnode);
+	void compute_followpos	(node* pnode);
+	node* node_at_treepos	(node* proot, ushort treepos);
+
+	// transition function-building functions
+	void build_transition_table();
+	void build_accepting_states(node* pnode);
+
+	// match-time transition reference functions
+	inline void next_states		(short_set* pcurr_states, uchar onchar);
+	inline bool is_accepting_set(const short_set* pset);
+
+	// cleanup functions
+	void tree_destroy		(node* pnode);
+	//------------------------------------------------------------
+
+private:
+	// no byval copying
+	_regex_(const _regex_& other) { }
+	void operator=(const _regex_& other) { }
+};
+
+
+};	// namespace soige
+
+#endif  // __regex_already_included_vasya__
+

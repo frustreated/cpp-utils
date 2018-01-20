@@ -1,0 +1,1 @@
+r[eo]+d matches red, rod, reed, and rood, but not reod or roed
